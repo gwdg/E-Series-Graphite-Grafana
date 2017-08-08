@@ -137,17 +137,17 @@ else {
     exit 1;
 }
 if ( $opts{'i'} ) {
-    if ( $opts{'i'} =~ $sys_id_pattern ) {
+#    if ( $opts{'i'} =~ $sys_id_pattern ) {
         $system_id = $opts{'i'};
         logPrint("Will only poll -$system_id-");
-    }
-    else {
-        logPrint( "$opts{'i'} does not seem to be a valid System ID,"
-                . " will validate it as System Name." );
+#    }
+#    else {
+#        logPrint( "$opts{'i'} does not seem to be a valid System ID,"
+#                . " will validate it as System Name." );
 
         # maybe a system name was provided, lets figure it out.
-        $fetch_id_from_name = 1;
-    }
+#        $fetch_id_from_name = 1;
+#    }
 }
 else {
     if ( $opts{'e'} ) {
