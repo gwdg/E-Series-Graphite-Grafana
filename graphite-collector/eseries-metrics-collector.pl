@@ -28,10 +28,16 @@ use Benchmark;
 use Sys::Syslog;
 use Scalar::Util qw(looks_like_number);
 
+# Additional perl modules
+use Time::HiRes;
+
 my $DEBUG            = 0;
 my $API_VER          = '/devmgr/v2';
 my $API_TIMEOUT      = 15;
 my $PUSH_TO_GRAPHITE = 1;
+
+# Prevent SSL errors
+$ENV{'PERL_LWP_SSL_VERIFY_HOSTNAME'} = 0
 
 # Selected metrics to collect from any Volume, for ease of reading keep sorted
 my %vol_metrics = (
@@ -291,7 +297,7 @@ else {
 
 print "Metrics Collected: \n " . Dumper( \$metrics_collected ) if $DEBUG;
 if ($PUSH_TO_GRAPHITE) {
-    post_to_graphite($metrics_collected);
+    post_to_influxdb($metrics_collected);
 }
 else {
     logPrint(
@@ -422,6 +428,83 @@ sub post_to_graphite {
                         "err"
                     );
                     undef $connection;
+                }
+            }
+        }
+    }
+}
+
+# Manage sending the metrics to InfluxDB
+sub post_to_influxdb {
+    my ($met_coll)              = (@_);
+    my $connection_timeout      = $config->{'influxdb'}->{'timeout'};
+    my $connection_server       = $config->{'influxdb'}->{'server'};
+    my $connection_protocol     = $config->{'influxdb'}->{'https'};
+    my $connection_port         = $config->{'influxdb'}->{'port'};
+    my $connection_user         = $config->{'influxdb'}->{'user'};
+    my $connection_password     = $config->{'influxdb'}->{'password'};   
+    my $connection_database     = $config->{'influxdb'}->{'database'};   
+
+    my $connection_url          = $connection_protocol . "://" . $connection_server . ":" . $connection_port . "/write?db=" . $connection_database;
+
+    logPrint("post_to_influxdb: using url: " . $connection_url) if $DEBUG;
+
+    # User higher resolution time
+    my ($s, $usec)              = Time::HiRes::gettimeofday();
+    my $epoch_ns                = ($s * 1000000 + $usec) * 1000;
+
+    my $volume_measurement      = "eseries_volume";
+    my $controller_measurement  = "eseries_controller";
+    my $drives_measurement      = "eseries_drives";
+
+    # Maximum number of metrics to send per one call
+    my $max_metrics_to_send     = 1000;
+
+    my $metric_line;
+    my $metric_lines            = "";
+    my $num_lines               = 0;
+
+    # Setup connection
+    my $connection = LWP::UserAgent->new;
+    $connection->timeout($API_TIMEOUT);
+    $connection->ssl_opts(verify_hostname => 0);
+    $connection->default_header( 'Content-type',    'application/json' );
+    $connection->default_header( 'Accept',          'application/json' );
+    $connection->default_header( 'Authorization',   'Basic ' . encode_base64( $connection_user . ':' . $connection_password ) );
+
+    # Send metrics for volumes
+    foreach my $system ( keys %$met_coll ) {
+        logPrint("post_to_influxdb: build metrics for [$system]") if $DEBUG;
+
+        foreach my $volume ( keys %{ $met_coll->{$system} } ) {
+            logPrint("post_to_graphite: Build Metrics for volume [$volume]") if $DEBUG;
+
+            foreach my $metric ( keys %{ $met_coll->{$system}->{$volume} } ) {
+
+                $metric_line
+                    = $volume_measurement   . ","
+                    . "system=" . $system   . ","
+                    . "volume=" . $volume   . " "
+                    . $metric . "=" . $met_coll->{$system}->{$volume}->{$metric} . " "
+                    . $epoch_ns;
+
+                $metric_lines   = $metric_line . "\n";
+                $num_lines      = $num_lines + 1;
+
+                if ( $num_lines >= $max_metrics_to_send ) {
+                    logPrint( "post_to_influxdb: sending batch of metrics to influxdb...") if $DEBUG;
+                    $num_lines = 0;
+
+                    # Try to find out ID based on name.
+                    my $response = $connection->post( $connection_url, Content => $metric_lines );
+
+                    if ( $response->is_success ) {
+                        $metric_lines = "";
+                    }
+                    else {
+                        logPrint("post_to_influxdb: request FAILED: " . $response->status_line, 'ERR');
+                        return;
+                    }
                 }
             }
         }
