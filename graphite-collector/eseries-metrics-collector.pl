@@ -37,10 +37,10 @@ my $API_TIMEOUT      = 15;
 my $PUSH_TO_GRAPHITE = 1;
 
 # Prevent SSL errors
-$ENV{'PERL_LWP_SSL_VERIFY_HOSTNAME'} = 0
+$ENV{'PERL_LWP_SSL_VERIFY_HOSTNAME'} = 0;
 
 # Selected metrics to collect from any Volume, for ease of reading keep sorted
-my %vol_metrics = (
+our %vol_metrics = (
     'averageReadOpSize'          => 0,
     'averageWriteOpSize'         => 0,
     'combinedIOps'               => 0,
@@ -356,6 +356,7 @@ sub get_vol_stats {
 # we care about.
 sub process_vol_metrics {
     my ( $sys_name, $vol_mets, $met_coll ) = (@_);
+    our %vol_metrics;
 
     for my $vol (@$vol_mets) {
         my $vol_name = $vol->{volumeName};
