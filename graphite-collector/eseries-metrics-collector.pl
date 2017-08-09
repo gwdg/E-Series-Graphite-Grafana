@@ -356,33 +356,20 @@ sub call_santricity_api {
 # ---------------------------------------------------------------------------------------------------------------------
 # Invoke remote API to get per volume statistics.
 sub get_vol_stats {
+
     my ( $sys_name, $sys_id, $met_coll ) = (@_);
 
-    my $t0 = Benchmark->new;
-    $log->debug("API: Calling analysed-volume-statistics");
-    my $stats_response
-        = $ua->get( $base_url
-            . $API_VER
-            . '/storage-systems/'
-            . $sys_id
-            . '/analysed-volume-statistics' );
-    my $t1 = Benchmark->new;
-    my $td = timediff( $t1, $t0 );
-    $log->debug( "API: Call took " . timestr($td) );
-    if ( $stats_response->is_success ) {
-        my $vol_stats = from_json( $stats_response->decoded_content );
-        $log->debug( "get_vol_stats: Number of vols: " . scalar(@$vol_stats) );
+    $log->debug("Calling analysed-volume-statistics...");
 
-        # skip if no vols present on this system
-        if ( scalar(@$vol_stats) ) {
-            process_vol_metrics( $sys_name, $vol_stats, $metrics_collected );
-        }
-        else {
-            $log->warn("Not processing $sys_name because it has no Volumes\n");
-        }
+    my $vol_stats = call_santricity_api($base_url . '/storage-systems/' . $sys_id . '/analysed-volume-statistics');
+    $log->debug( "get_vol_stats: Number of vols: " . scalar(@$vol_stats) );
+
+    # skip if no vols present on this system
+    if ( scalar(@$vol_stats) ) {
+        process_vol_metrics( $sys_name, $vol_stats, $metrics_collected );
     }
     else {
-        die $stats_response->status_line;
+        $log->warn("Not processing $sys_name because it has no Volumes\n");
     }
 }
 
@@ -552,34 +539,20 @@ sub post_to_influxdb {
 # ---------------------------------------------------------------------------------------------------------------------
 # Invoke remote API to get per drive statistics.
 sub get_drive_stats {
+
     my ( $sys_name, $sys_id, $met_coll ) = (@_);
 
-    my $t0 = Benchmark->new;
-    $log->debug("API: Calling analysed-drive-statistics");
-    my $stats_response
-        = $ua->get( $base_url
-            . $API_VER
-            . '/storage-systems/'
-            . $sys_id
-            . '/analysed-drive-statistics' );
-    my $t1 = Benchmark->new;
-    my $td = timediff( $t1, $t0 );
-    $log->debug("API: Call took " . timestr($td));
-    if ( $stats_response->is_success ) {
-        my $drive_stats = from_json( $stats_response->decoded_content );
-        $log->debug("Number of drives: " . scalar(@$drive_stats));
+    $log->debug("Calling analysed-drive-statistics...");
 
-        # skip if no drives present on this system (really possible?)
-        if ( scalar(@$drive_stats) ) {
-            process_drive_metrics( $sys_name, $drive_stats,
-                $metrics_collected );
-        }
-        else {
-            $log->warn("Not processing $sys_name because it has no Drives");
-        }
+    my $drive_stats = call_santricity_api($base_url . '/storage-systems/' . $sys_id . '/analysed-drive-statistics');
+    $log->debug("Number of drives: " . scalar(@$drive_stats));
+
+    # skip if no drives present on this system (really possible?)
+    if ( scalar(@$drive_stats) ) {
+        process_drive_metrics( $sys_name, $drive_stats, $metrics_collected );
     }
     else {
-        die $stats_response->status_line;
+        $log->warn("Not processing [$sys_name] because it has no drives.");
     }
 }
 
@@ -587,11 +560,12 @@ sub get_drive_stats {
 # Coalece Drive metrics into custom structure, to just store the ones
 # we care about.
 sub process_drive_metrics {
+
     my ( $sys_name, $drv_mets, $met_coll ) = (@_);
 
     for my $drv (@$drv_mets) {
         my $disk_id = $drv->{diskId};
-        $log->debug("DiskID " . $disk_id);
+        $log->debug("Disk-ID: " . $disk_id);
         my $drv_met_key = "$disk_id";
         $metrics_collected->{$sys_name}->{$drv_met_key} = {};
 
@@ -627,40 +601,25 @@ sub get_sysid_from_name {
     }
 
     # No Match Found!
-    warn "Not able to match $id_provided with a System Name, giving up!\n";
+    $log->warn("Not able to match $id_provided with a System Name, giving up!");
     exit 1;
 }
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Invoke remote API to get live performance statistics.
 sub get_live_statistics {
+
     my ( $sys_name, $sys_id, $met_coll ) = (@_);
 
-    my $t0 = Benchmark->new;
-    $log->debug("API: Calling live-statistics");
-    my $stats_response
-        = $ua->get( $base_url
-            . $API_VER
-            . '/storage-systems/'
-            . $sys_id
-            . '/live-statistics' );
-    my $t1 = Benchmark->new;
-    my $td = timediff( $t1, $t0 );
-    $log->debug("API: Call took " . timestr($td));
-    if ( $stats_response->is_success ) {
-        my $live_stats = from_json( $stats_response->decoded_content );
+    $log->debug("Calling live-statistics...");
 
-        #print  Dumper (\$live_stats) if $DEBUG;
-        my $cont_stats  = %{$live_stats->{'controllerStats'}};
+    my $live_stats = call_santricity_api($base_url . '/storage-systems/' . $sys_id . '/live-statistics');
+    #print  Dumper (\$live_stats) if $DEBUG;
+    my $cont_stats  = %{$live_stats->{'controllerStats'}};
 
-        foreach my $controller (@$cont_stats) {
-            $log->debug("controller_stats for controllerId: $controller->{'controllerId'} - ". $controller->{'cpuUtilizationStats'}[0]->{'maxCpuUtilization'}. " \n");
-            print Dumper(\$controller) if $DEBUG;
-        }
-        exit 0;
-
+    foreach my $controller (@$cont_stats) {
+        $log->debug("controller_stats for controllerId: $controller->{'controllerId'} - ". $controller->{'cpuUtilizationStats'}[0]->{'maxCpuUtilization'}. " \n");
+        print Dumper(\$controller) if $DEBUG;
     }
-    else {
-        die $stats_response->status_line;
-    }
+    exit 0;
 }
