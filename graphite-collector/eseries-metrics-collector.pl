@@ -264,14 +264,14 @@ sub main_loop {
         my $storage_systems = call_santricity_api($base_url . '/storage-systems/' . $system_id);
 
         # When polling only one system we get a Hash.
-        my $stg_sys_name = $storage_systems->{name};
-        my $stg_sys_id   = $storage_systems->{id};
+        my $system_name = $storage_systems->{name};
+        my $system_id   = $storage_systems->{id};
 
-        $log->debug("Processing $stg_sys_name [$stg_sys_id]");
+        $log->debug("Processing $system_name [$system_id]");
 
-        $metrics_collected->{$stg_sys_name} = {};
+        $metrics_collected->{$system_name} = {};
 
-        get_vol_stats( $stg_sys_name, $stg_sys_id, $metrics_collected );
+        get_vol_stats($system_name, $system_id, $metrics_collected);
 #        get_drive_stats( $stg_sys_name, $stg_sys_id, $metrics_collected );
 
         if ( $opts{'e'} ) {
@@ -284,16 +284,23 @@ sub main_loop {
        my $storage_systems = call_santricity_api($base_url . '/storage-systems' );
 
        # All systems polled, we get an array of hashes.
-        for my $stg_sys (@$storage_systems) {
-            my $stg_sys_name = $stg_sys->{name};
-            my $stg_sys_id   = $stg_sys->{id};
+        for my $system (@$storage_systems) {
 
-            $log->debug("Processing $stg_sys_name ($stg_sys_id)");
+            my $system_name        = $system->{name};
+            my $system_id          = $system->{id};
+            my $system_drivecount  = $system->{drivecount};
 
-            $metrics_collected->{$stg_sys_name} = {};
+            if ($system_drivecount > 0) {
+                $log->debug("Processing $system_name [$system_id]");
 
-            get_vol_stats( $stg_sys_name, $stg_sys_id, $metrics_collected );
-#            get_drive_stats( $stg_sys_name, $stg_sys_id, $metrics_collected );
+                $metrics_collected->{$system_name} = {};
+
+                get_vol_stats($system_name, $system_id, $metrics_collected);
+    #            get_drive_stats( $stg_sys_name, $stg_sys_id, $metrics_collected );
+            } else {
+                # Skip system (was not reached => other operations will fail)
+                $log->debug("Skipping $system_name [$system_id], no drives / not reachable!");
+            }
         }
     }
 
