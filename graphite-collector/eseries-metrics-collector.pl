@@ -37,6 +37,7 @@ my $DEBUG            = 0;
 my $API_VER          = '/devmgr/v2';
 my $API_TIMEOUT      = 15;
 my $PUSH_TO_GRAPHITE = 1;
+my $POLLING_INTERVAL = 60;
 
 # How often to retry to connect when failing to connect to NetApp Santricity Webproxy API endpoint
 use constant MAX_RETRIES        => 3;
@@ -237,7 +238,7 @@ our $iteration = 0;
 my $loop = IO::Async::Loop->new;
  
 my $timer = IO::Async::Timer::Periodic->new(
-   interval => $plugin->opts->wait,
+   interval => $POLLING_INTERVAL,
    on_tick  => \&main_loop,
 );
  
@@ -260,7 +261,7 @@ sub main_loop {
     our $iteration;
 
     if ($system_id) {
-        $storage_systems = call_santricity_api($base_url . '/storage-systems/' . $system_id);
+        my $storage_systems = call_santricity_api($base_url . '/storage-systems/' . $system_id);
 
         # When polling only one system we get a Hash.
         my $stg_sys_name = $storage_systems->{name};
@@ -280,7 +281,7 @@ sub main_loop {
         }
     }
     else {
-        $storage_systems = call_santricity_api($base_url . '/storage-systems' );
+       my $storage_systems = call_santricity_api($base_url . '/storage-systems' );
 
        # All systems polled, we get an array of hashes.
         for my $stg_sys (@$storage_systems) {
