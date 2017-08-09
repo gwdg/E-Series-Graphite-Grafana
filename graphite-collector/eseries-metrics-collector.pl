@@ -259,7 +259,7 @@ if ( $response->is_success ) {
         $metrics_collected->{$stg_sys_name} = {};
 
         get_vol_stats( $stg_sys_name, $stg_sys_id, $metrics_collected );
-        get_drive_stats( $stg_sys_name, $stg_sys_id, $metrics_collected );
+#        get_drive_stats( $stg_sys_name, $stg_sys_id, $metrics_collected );
 
         if ( $opts{'e'} ) {
             # For embedded systems we get extra metrics to poll.
@@ -279,7 +279,7 @@ if ( $response->is_success ) {
             $metrics_collected->{$stg_sys_name} = {};
 
             get_vol_stats( $stg_sys_name, $stg_sys_id, $metrics_collected );
-            get_drive_stats( $stg_sys_name, $stg_sys_id, $metrics_collected );
+#            get_drive_stats( $stg_sys_name, $stg_sys_id, $metrics_collected );
         }
     }
 }
