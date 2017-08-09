@@ -37,7 +37,7 @@ my $DEBUG            = 0;
 my $API_VER          = '/devmgr/v2';
 my $API_TIMEOUT      = 15;
 my $PUSH_TO_GRAPHITE = 1;
-my $POLLING_INTERVAL = 60;
+my $POLLING_INTERVAL = 5;
 
 # How often to retry to connect when failing to connect to NetApp Santricity Webproxy API endpoint
 use constant MAX_RETRIES        => 3;
@@ -115,7 +115,7 @@ my $fetch_id_from_name = 0;
 
 my $log4j_conf = q(
 
-   log4perl.category.GWDG.NetApp = INFO, Screen, Logfile
+   log4perl.category.GWDG.NetApp = DEBUG, Screen, Logfile
 #    log4perl.category.GWDG.NetApp = DEBUG, Logfile
 
     log4perl.appender.Logfile = Log::Log4perl::Appender::File
@@ -513,15 +513,15 @@ sub post_to_influxdb {
                     $log->debug("Sending batch of metrics to influxdb...");
                     $num_lines = 0;
 
-#                    my $response = $connection->post( $connection_url, Content => $metric_lines );
+                    my $response = $connection->post( $connection_url, Content => $metric_lines );
 
-#                    if ( $response->is_success ) {
+                    if ( $response->is_success ) {
                         $metric_lines = "";
-#                    }
-#                    else {
-#                        $log->error("Request FAILED: " . $response->status_line);
-#                        return;
-#                    }
+                    }
+                    else {
+                        $log->error("Request FAILED: " . $response->status_line);
+                        return;
+                    }
                 }
             }
         }
@@ -529,11 +529,11 @@ sub post_to_influxdb {
 
     # Send the rest of the metrics
     $log->debug( "Metrics to send: " . $metric_lines);
-#    my $response = $connection->post( $connection_url, Content => $metric_lines );
+    my $response = $connection->post( $connection_url, Content => $metric_lines );
 
-#    if ( !$response->is_success ) {
-#        $log->debug("Request FAILED: " . $response->status_line);
-#    }
+    if ( !$response->is_success ) {
+        $log->debug("Request FAILED: " . $response->status_line);
+    }
 }
 
 # ---------------------------------------------------------------------------------------------------------------------
