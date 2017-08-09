@@ -37,7 +37,8 @@ my $DEBUG            = 0;
 my $API_VER          = '/devmgr/v2';
 my $API_TIMEOUT      = 15;
 my $PUSH_TO_GRAPHITE = 1;
-my $POLLING_INTERVAL = 5;
+my $POLLING_INTERVAL = 20;
+my $BATCH_SIZE       = 100;
 
 # How often to retry to connect when failing to connect to NetApp Santricity Webproxy API endpoint
 use constant MAX_RETRIES        => 3;
@@ -115,7 +116,7 @@ my $fetch_id_from_name = 0;
 
 my $log4j_conf = q(
 
-   log4perl.category.GWDG.NetApp = DEBUG, Screen, Logfile
+    log4perl.category.GWDG.NetApp = INFO, Screen, Logfile
 #    log4perl.category.GWDG.NetApp = DEBUG, Logfile
 
     log4perl.appender.Logfile = Log::Log4perl::Appender::File
@@ -286,9 +287,11 @@ sub main_loop {
        # All systems polled, we get an array of hashes.
         for my $system (@$storage_systems) {
 
+#            print "System hash: \n " . Dumper( \$system );
+
             my $system_name        = $system->{name};
             my $system_id          = $system->{id};
-            my $system_drivecount  = $system->{drivecount};
+            my $system_drivecount  = $system->{driveCount};
 
             if ($system_drivecount > 0) {
                 $log->debug("Processing $system_name [$system_id]");
@@ -299,12 +302,12 @@ sub main_loop {
     #            get_drive_stats( $stg_sys_name, $stg_sys_id, $metrics_collected );
             } else {
                 # Skip system (was not reached => other operations will fail)
-                $log->debug("Skipping $system_name [$system_id], no drives / not reachable!");
+                $log->warn("Skipping $system_name [$system_id], no drives / not reachable!");
             }
         }
     }
 
-    print "Metrics Collected: \n " . Dumper( \$metrics_collected ) if $DEBUG;
+#    print "Metrics Collected: \n " . Dumper( \$metrics_collected ) if $DEBUG;
 
     if ($PUSH_TO_GRAPHITE) {
         post_to_influxdb($metrics_collected);
@@ -482,9 +485,6 @@ sub post_to_influxdb {
     my $controller_measurement  = "eseries_controller";
     my $drives_measurement      = "eseries_drives";
 
-    # Maximum number of metrics to send per one call
-    my $max_metrics_to_send     = 1000;
-
     my $metric_line;
     my $metric_lines            = "";
     my $num_lines               = 0;
@@ -500,27 +500,33 @@ sub post_to_influxdb {
     # Send metrics for volumes
     foreach my $system ( keys %$met_coll ) {
         $log->debug("Build metrics for [$system]");
+        my $system_tr = $system;
+        $system_tr =~ tr/ /_/;
 
         foreach my $volume ( keys %{ $met_coll->{$system} } ) {
             $log->debug("Build metrics for volume [$volume]");
+            my $volume_tr =  $volume;
+            $volume_tr =~ tr/ /_/;
 
             foreach my $metric ( keys %{ $met_coll->{$system}->{$volume} } ) {
 
                 $metric_line
-                    = $volume_measurement   . ","
-                    . "system=" . $system   . ","
-                    . "volume=" . $volume   . " "
+                    = $volume_measurement      . ","
+                    . "system=" . $system_tr   . ","
+                    . "volume=" . $volume_tr   . " "
                     . $metric . "=" . $met_coll->{$system}->{$volume}->{$metric} . " "
                     . $epoch_ns;
 
                 $metric_lines   = $metric_lines . $metric_line . "\n";
                 $num_lines      = $num_lines + 1;
 
-                if ( $num_lines >= $max_metrics_to_send ) {
+                if ( $num_lines >= $BATCH_SIZE ) {
                     $log->debug("Sending batch of metrics to influxdb...");
                     $num_lines = 0;
 
                     my $response = $connection->post( $connection_url, Content => $metric_lines );
+
+#                    print "InfluxDB request content: " . $metric_lines;
 
                     if ( $response->is_success ) {
                         $metric_lines = "";
