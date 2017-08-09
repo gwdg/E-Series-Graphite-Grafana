@@ -361,7 +361,7 @@ sub process_vol_metrics {
     for my $vol (@$vol_mets) {
         my $vol_name = $vol->{volumeName};
         logPrint( "process_vol_metrics: Volume Name " . $vol_name ) if $DEBUG;
-        my $vol_met_key = "volume_statistics.$vol_name";
+        my $vol_met_key = "$vol_name";
         $metrics_collected->{$sys_name}->{$vol_met_key} = {};
 
         #print Dumper($vol);
@@ -440,7 +440,7 @@ sub post_to_influxdb {
     my ($met_coll)              = (@_);
     my $connection_timeout      = $config->{'influxdb'}->{'timeout'};
     my $connection_server       = $config->{'influxdb'}->{'server'};
-    my $connection_protocol     = $config->{'influxdb'}->{'https'};
+    my $connection_protocol     = $config->{'influxdb'}->{'protocol'};
     my $connection_port         = $config->{'influxdb'}->{'port'};
     my $connection_user         = $config->{'influxdb'}->{'user'};
     my $connection_password     = $config->{'influxdb'}->{'password'};   
@@ -478,7 +478,7 @@ sub post_to_influxdb {
         logPrint("post_to_influxdb: build metrics for [$system]") if $DEBUG;
 
         foreach my $volume ( keys %{ $met_coll->{$system} } ) {
-            logPrint("post_to_graphite: Build Metrics for volume [$volume]") if $DEBUG;
+            logPrint("post_to_influxdb: build metrics for volume [$volume]") if $DEBUG;
 
             foreach my $metric ( keys %{ $met_coll->{$system}->{$volume} } ) {
 
@@ -489,33 +489,34 @@ sub post_to_influxdb {
                     . $metric . "=" . $met_coll->{$system}->{$volume}->{$metric} . " "
                     . $epoch_ns;
 
-                $metric_lines   = $metric_line . "\n";
+                $metric_lines   = $metric_lines . $metric_line . "\n";
                 $num_lines      = $num_lines + 1;
 
                 if ( $num_lines >= $max_metrics_to_send ) {
                     logPrint( "post_to_influxdb: sending batch of metrics to influxdb...") if $DEBUG;
                     $num_lines = 0;
 
-                    my $response = $connection->post( $connection_url, Content => $metric_lines );
+#                    my $response = $connection->post( $connection_url, Content => $metric_lines );
 
-                    if ( $response->is_success ) {
+#                    if ( $response->is_success ) {
                         $metric_lines = "";
-                    }
-                    else {
-                        logPrint("post_to_influxdb: request FAILED: " . $response->status_line, 'ERR');
-                        return;
-                    }
+#                    }
+#                    else {
+#                        logPrint("post_to_influxdb: request FAILED: " . $response->status_line, 'ERR');
+#                        return;
+#                    }
                 }
             }
         }
     }
 
     # Send the rest of the metrics
-    my $response = $connection->post( $connection_url, Content => $metric_lines );
+    logPrint( "post_to_influxdb: metrics to send: " . $metric_lines) if $DEBUG;
+#    my $response = $connection->post( $connection_url, Content => $metric_lines );
 
-    if ( !$response->is_success ) {
-        logPrint("post_to_influxdb: request FAILED: " . $response->status_line, 'ERR');
-    }
+#    if ( !$response->is_success ) {
+#        logPrint("post_to_influxdb: request FAILED: " . $response->status_line, 'ERR');
+#    }
 }
 
 # Invoke remote API to get per drive statistics.
@@ -561,7 +562,7 @@ sub process_drive_metrics {
     for my $drv (@$drv_mets) {
         my $disk_id = $drv->{diskId};
         logPrint( "process_drive_metrics: DiskID " . $disk_id ) if $DEBUG;
-        my $drv_met_key = "drive_statistics.$disk_id";
+        my $drv_met_key = "$disk_id";
         $metrics_collected->{$sys_name}->{$drv_met_key} = {};
 
         #print Dumper($drv);
