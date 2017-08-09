@@ -496,7 +496,6 @@ sub post_to_influxdb {
                     logPrint( "post_to_influxdb: sending batch of metrics to influxdb...") if $DEBUG;
                     $num_lines = 0;
 
-                    # Try to find out ID based on name.
                     my $response = $connection->post( $connection_url, Content => $metric_lines );
 
                     if ( $response->is_success ) {
@@ -509,6 +508,13 @@ sub post_to_influxdb {
                 }
             }
         }
+    }
+
+    # Send the rest of the metrics
+    my $response = $connection->post( $connection_url, Content => $metric_lines );
+
+    if ( !$response->is_success ) {
+        logPrint("post_to_influxdb: request FAILED: " . $response->status_line, 'ERR');
     }
 }
 
