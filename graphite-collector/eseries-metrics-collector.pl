@@ -25,16 +25,24 @@ use JSON;
 use Config::Tiny;
 use Getopt::Std;
 use Benchmark;
-use Sys::Syslog;
 use Scalar::Util qw(looks_like_number);
 
 # Additional perl modules
 use Time::HiRes;
+use IO::Async::Timer::Periodic;
+use IO::Async::Loop;
+use Log::Log4perl;
 
 my $DEBUG            = 0;
 my $API_VER          = '/devmgr/v2';
 my $API_TIMEOUT      = 15;
 my $PUSH_TO_GRAPHITE = 1;
+
+# How often to retry to connect when failing to connect to NetApp Santricity Webproxy API endpoint
+use constant MAX_RETRIES        => 3;
+
+# How long to wait between reconnects in ms
+use constant SLEEP_ON_ERROR_MS  => 1000;
 
 # Prevent SSL errors
 $ENV{'PERL_LWP_SSL_VERIFY_HOSTNAME'} = 0;
@@ -101,8 +109,28 @@ my $sys_id_pattern = qr/\w{8}-\w{4}-\w{4}-\w{4}-\w{12}/;
 # Flag to detect ID based on System Name.
 my $fetch_id_from_name = 0;
 
-# Send our output to rsyslog.
-openlog( 'eseries-metrics-collector', 'pid', 'local0' );
+# ---------------------------------------------------------------------------------------------------------------------
+# Initialize logger
+
+my $log4j_conf = q(
+
+   log4perl.category.GWDG.NetApp = INFO, Screen, Logfile
+#    log4perl.category.GWDG.NetApp = DEBUG, Logfile
+
+    log4perl.appender.Logfile = Log::Log4perl::Appender::File
+    log4perl.appender.Logfile.filename = /var/log/check_netapp.log
+    log4perl.appender.Logfile.layout = Log::Log4perl::Layout::PatternLayout
+    log4perl.appender.Logfile.layout.ConversionPattern = [%d %F:%M:%L] %m%n
+
+    log4perl.appender.Screen = Log::Log4perl::Appender::Screen
+    log4perl.appender.Screen.stderr = 0
+    log4perl.appender.Screen.layout = Log::Log4perl::Layout::PatternLayout
+    log4perl.appender.Screen.layout.ConversionPattern = [%d %F:%M:%L] %m%n
+);
+
+Log::Log4perl::init(\$log4j_conf);
+
+our $log = Log::Log4perl::get_logger("GWDG::NetApp");
 
 # Command line opts parsing and processing.
 my %opts = ( h => undef );
@@ -124,52 +152,42 @@ if ( $opts{'h'} ) {
 }
 if ( $opts{'d'} ) {
     $DEBUG = 1;
-    logPrint("Executing in DEBUG mode, enjoy the verbosity :)");
+    $log->info("Executing in DEBUG mode, enjoy the verbosity :)");
 }
 if ( $opts{'c'} ) {
     if ( not -e -f -r $opts{'c'} ) {
-        warn "Access problems to $opts{'c'} - check path and permissions.\n";
+        $log->warn("Access problems to $opts{'c'} - check path and permissions.");
         exit 1;
     }
 }
 else {
-    warn "Need to define a webservice proxy config file.\n";
+    $log->warn("Need to define a webservice proxy config file.");
     exit 1;
 }
 if ( $opts{'i'} ) {
-#    if ( $opts{'i'} =~ $sys_id_pattern ) {
-        $system_id = $opts{'i'};
-        logPrint("Will only poll -$system_id-");
-#    }
-#    else {
-#        logPrint( "$opts{'i'} does not seem to be a valid System ID,"
-#                . " will validate it as System Name." );
-
-        # maybe a system name was provided, lets figure it out.
-#        $fetch_id_from_name = 1;
-#    }
+    $system_id = $opts{'i'};
+    $log->info("Will only poll [$system_id]");
 }
 else {
     if ( $opts{'e'} ) {
-        warn "For Embedded mode you need to provide an ID to poll, otherwise we can't collect any metrics.\n";
+        $log->warn("For Embedded mode you need to provide an ID to poll, otherwise we can't collect any metrics.");
         exit 1;
     }
-
-    logPrint("Will poll all known systems by Webservice proxy.");
+    $log->debug("Will poll all known systems by Webservice proxy.");
 }
 if ( $opts{'n'} ) {
 
     # unset this, as user defined to not send metrics to graphite.
     $PUSH_TO_GRAPHITE = 0;
-    logPrint("User decided to not push metrics to graphite.");
+    $log->info("User decided to not push metrics to graphite.");
 }
 if ( $opts{'t'} ) {
     if ( looks_like_number( $opts{'t'} ) ) {
         $API_TIMEOUT = $opts{'t'};
-        logPrint("Redefined timeout to $API_TIMEOUT seconds");
+        $log->info("Redefined timeout to $API_TIMEOUT seconds");
     }
     else {
-        warn "Timeout ($opts{'t'}) is not a valid number. Using default.\n";
+        $log->warn("Timeout ($opts{'t'}) is not a valid number. Using default.");
     }
 }
 
@@ -195,66 +213,60 @@ else {
     }
 }
 
-my $base_url
+# Build base url
+our $base_url
     = $config->{_}->{proto} . '://'
     . $endpoint . ':'
-    . $config->{_}->{port};
+    . $config->{_}->{port}
+    . $API_VER;
 
-logPrint("Base URL for Statistics Collection=$base_url") if $DEBUG;
+$log->debug("Base URL for statistics collection: $base_url");
 
-my $ua = LWP::UserAgent->new;
-$ua->timeout($API_TIMEOUT);
+our $santricity_connection = LWP::UserAgent->new;
+$santricity_connection->timeout($API_TIMEOUT);
 
 # TODO make this configurable.
-$ua->ssl_opts(verify_hostname => 0);
-$ua->default_header( 'Content-type', 'application/json' );
-$ua->default_header( 'Accept',       'application/json' );
-$ua->default_header( 'Authorization',
-    'Basic ' . encode_base64( $username . ':' . $password ) );
-my $t0 = Benchmark->new;
+$santricity_connection->ssl_opts(verify_hostname => 0);
+$santricity_connection->default_header( 'Content-type',     'application/json' );
+$santricity_connection->default_header( 'Accept',           'application/json' );
+$santricity_connection->default_header( 'Authorization',    'Basic ' . encode_base64( $username . ':' . $password ) );
 
-my $response;
-if ($fetch_id_from_name) {
+# Setup main loop processing
+our $iteration = 0;
 
-    # Try to find out ID based on name.
-    $response = $ua->get( $base_url . $API_VER . '/storage-systems' );
+my $loop = IO::Async::Loop->new;
+ 
+my $timer = IO::Async::Timer::Periodic->new(
+   interval => $plugin->opts->wait,
+   on_tick  => \&main_loop,
+);
+ 
+$timer->start;
+$loop->add( $timer );
+$loop->run;
 
-    if ( $response->is_success ) {
-        if ($fetch_id_from_name) {
-            $system_id = get_sysid_from_name( $response, $opts{'i'} );
-            logPrint("Found SystemID $system_id for $opts{'i'}");
-        }
-    }
-    else {
-        logPrint("Request FAILED: " . $response->status_line, 'ERR');
-        die $response->status_line;
-    }
-}
+$log->info('Execution completed');
+exit 0;
 
-if ($system_id) {
-    logPrint("API: Calling storage-systems/{system-id} ...");
-    $response
-        = $ua->get( $base_url . $API_VER . '/storage-systems/' . $system_id );
-}
-else {
-    logPrint("API: Calling storage-systems...");
-    $response = $ua->get( $base_url . $API_VER . '/storage-systems' );
-}
-my $t1 = Benchmark->new;
-my $td = timediff( $t1, $t0 );
-logPrint( "API: Call took " . timestr($td) );
+# ---------------------------------------------------------------------------------------------------------------------
+# Main loop
 
-if ( $response->is_success ) {
-    my $storage_systems = from_json( $response->decoded_content );
+sub main_loop {
 
-    print Dumper( \$storage_systems ) if $DEBUG;
+    # Get iteration start time
+    my $iteration_start_time = Time::HiRes::gettimeofday();
+
+    # Iteration counter
+    our $iteration;
+
     if ($system_id) {
+        $storage_systems = call_santricity_api($base_url . '/storage-systems/' . $system_id);
 
         # When polling only one system we get a Hash.
         my $stg_sys_name = $storage_systems->{name};
         my $stg_sys_id   = $storage_systems->{id};
 
-        logPrint("Processing $stg_sys_name ($stg_sys_id)");
+        $log->debug("Processing $stg_sys_name [$stg_sys_id]");
 
         $metrics_collected->{$stg_sys_name} = {};
 
@@ -268,13 +280,14 @@ if ( $response->is_success ) {
         }
     }
     else {
+        $storage_systems = call_santricity_api($base_url . '/storage-systems' );
 
-        # All systems polled, we get an array of hashes.
+       # All systems polled, we get an array of hashes.
         for my $stg_sys (@$storage_systems) {
             my $stg_sys_name = $stg_sys->{name};
             my $stg_sys_id   = $stg_sys->{id};
 
-            logPrint("Processing $stg_sys_name ($stg_sys_id)");
+            $log->debug("Processing $stg_sys_name ($stg_sys_id)");
 
             $metrics_collected->{$stg_sys_name} = {};
 
@@ -282,49 +295,70 @@ if ( $response->is_success ) {
 #            get_drive_stats( $stg_sys_name, $stg_sys_id, $metrics_collected );
         }
     }
-}
-else {
-    if ( $response->code eq '404' ) {
-        warn "The SystemID: " . $system_id . ", is unknown by the proxy.\n";
-        warn "Please check the documentation on how to search for it."
-            . " Or try providing the System Name.\n";
-        exit 1;
+
+    print "Metrics Collected: \n " . Dumper( \$metrics_collected ) if $DEBUG;
+
+    if ($PUSH_TO_GRAPHITE) {
+        post_to_influxdb($metrics_collected);
     }
     else {
-        die $response->status_line;
+        $log->info("No metrics sent to graphite. Remove the -n if this was not intended.");
     }
+
+    # Get iteration end time
+    my $iteration_end_time = Time::HiRes::gettimeofday();
+    my $iteration_duration_string = sprintf("%.4f", $iteration_end_time - $iteration_start_time);
+
+    # Wait
+    $iteration++;
+    $log->info("Finished iteration [$iteration] in [$iteration_duration_string] seconds => waiting...");
 }
 
-print "Metrics Collected: \n " . Dumper( \$metrics_collected ) if $DEBUG;
-if ($PUSH_TO_GRAPHITE) {
-    post_to_influxdb($metrics_collected);
-}
-else {
-    logPrint(
-        "No metrics sent to graphite. Remove the -n if this was not intended."
-    );
-}
+# ---------------------------------------------------------------------------------------------------------------------
+sub call_santricity_api {
 
-logPrint('Execution completed');
-exit 0;
+    my $request_url = shift;
 
-# Utility sub to send info to rsyslog and STDERR if in debug mode.
-sub logPrint {
-    my $text = shift;
-    my $level = shift || 'info';
+    our $santricity_connection;
+    our $base_url;
 
-    if ($text) {
-        syslog( $level, $text );
-        $DEBUG && warn $level . ' ' . $text . "\n";
+    $log->info("API request: " . $request_url);
+    
+    my $i = 1;
+    while ($i <= MAX_RETRIES) {
+
+        my $t0 = Benchmark->new;
+ 
+        my $response = $santricity_connection->get($request_url);
+ 
+        my $t1 = Benchmark->new;
+        my $td = timediff( $t1, $t0 );
+        $log->debug("Call took: " . timestr($td));
+
+        if ( $response->is_success ) {
+            my $data = from_json($response->decoded_content);
+ #           print Dumper( \$storage_systems ) if $DEBUG;
+            return $data;
+        }
+
+        # Request failed: wait + retry
+        $log->error("API request failed: " . $response->status_line);
+        $log->error("=> Retrying (try $i of " . MAX_RETRIES . ")");
+        Time::HiRes::usleep(SLEEP_ON_ERROR_MS);
+        $i++;
     }
+
+    # Nothing else we can do
+    return;
 }
 
+# ---------------------------------------------------------------------------------------------------------------------
 # Invoke remote API to get per volume statistics.
 sub get_vol_stats {
     my ( $sys_name, $sys_id, $met_coll ) = (@_);
 
     my $t0 = Benchmark->new;
-    logPrint("API: Calling analysed-volume-statistics");
+    $log->debug("API: Calling analysed-volume-statistics");
     my $stats_response
         = $ua->get( $base_url
             . $API_VER
@@ -333,18 +367,17 @@ sub get_vol_stats {
             . '/analysed-volume-statistics' );
     my $t1 = Benchmark->new;
     my $td = timediff( $t1, $t0 );
-    logPrint( "API: Call took " . timestr($td) );
+    $log->debug( "API: Call took " . timestr($td) );
     if ( $stats_response->is_success ) {
         my $vol_stats = from_json( $stats_response->decoded_content );
-        logPrint( "get_vol_stats: Number of vols: " . scalar(@$vol_stats) );
+        $log->debug( "get_vol_stats: Number of vols: " . scalar(@$vol_stats) );
 
         # skip if no vols present on this system
         if ( scalar(@$vol_stats) ) {
             process_vol_metrics( $sys_name, $vol_stats, $metrics_collected );
         }
         else {
-            warn "Not processing $sys_name because it has no Volumes\n"
-                if $DEBUG;
+            $log->warn("Not processing $sys_name because it has no Volumes\n");
         }
     }
     else {
@@ -352,6 +385,7 @@ sub get_vol_stats {
     }
 }
 
+# ---------------------------------------------------------------------------------------------------------------------
 # Coalece Collecter metrics into custom structure, to just store the ones
 # we care about.
 sub process_vol_metrics {
@@ -360,7 +394,7 @@ sub process_vol_metrics {
 
     for my $vol (@$vol_mets) {
         my $vol_name = $vol->{volumeName};
-        logPrint( "process_vol_metrics: Volume Name " . $vol_name ) if $DEBUG;
+        $log->debug( "process_vol_metrics: Volume Name " . $vol_name );
         my $vol_met_key = "$vol_name";
         $metrics_collected->{$sys_name}->{$vol_met_key} = {};
 
@@ -376,8 +410,10 @@ sub process_vol_metrics {
     }
 }
 
+# ---------------------------------------------------------------------------------------------------------------------
 # Manage Sending the metrics to Graphite Instance
 sub post_to_graphite {
+
     my ($met_coll)          = (@_);
     my $local_relay_timeout = $config->{'graphite'}->{'timeout'};
     my $local_relay_server  = $config->{'graphite'}->{'server'};
@@ -388,7 +424,7 @@ sub post_to_graphite {
     my $full_metric;
 
     my $socket_err;
-    logPrint("post_to_graphite: Issuing new socket connect.") if $DEBUG;
+    $log->debug("Issuing new socket connect.");
     my $connection = IO::Socket::INET->new(
         PeerAddr => $local_relay_server,
         PeerPort => $local_relay_port,
@@ -398,18 +434,14 @@ sub post_to_graphite {
 
     if ( !defined $connection ) {
         $socket_err = $! || 'failed without a specific library error';
-        logPrint(
-            "post_to_graphite: New socket connect failure with reason: [$socket_err]",
-            "err"
-        );
+        $log->error("New socket connect failure with reason: [$socket_err]");
     }
 
     # Send metrics and upon error fail fast
     foreach my $system ( keys %$met_coll ) {
-        logPrint("post_to_graphite: Build Metrics for -$system-") if $DEBUG;
+        $log->debug("Build Metrics for -$system-");
         foreach my $vols ( keys %{ $met_coll->{$system} } ) {
-            logPrint("post_to_graphite: Build Metrics for vol -$vols-")
-                if $DEBUG;
+            $log->debug("Build Metrics for vol -$vols-");
             foreach my $mets ( keys %{ $met_coll->{$system}->{$vols} } ) {
                 $full_metric
                     = $metrics_path . "."
@@ -418,16 +450,11 @@ sub post_to_graphite {
                     . $mets . " "
                     . $met_coll->{$system}->{$vols}->{$mets} . " "
                     . $epoch;
-                logPrint( "post_to_graphite: Metric: " . $full_metric )
-                    if $DEBUG;
+                $log->debug( "Metric: " . $full_metric );
 
                 if ( !defined $connection->send("$full_metric\n") ) {
-                    $socket_err = $!
-                        || 'failed without a specific library error';
-                    logPrint(
-                        "post_to_graphite: Socket failure with reason: [$socket_err]",
-                        "err"
-                    );
+                    $socket_err = $! || 'failed without a specific library error';
+                    $log->error("post_to_graphite: Socket failure with reason: [$socket_err]");
                     undef $connection;
                 }
             }
@@ -435,8 +462,10 @@ sub post_to_graphite {
     }
 }
 
+# ---------------------------------------------------------------------------------------------------------------------
 # Manage sending the metrics to InfluxDB
 sub post_to_influxdb {
+    
     my ($met_coll)              = (@_);
     my $connection_timeout      = $config->{'influxdb'}->{'timeout'};
     my $connection_server       = $config->{'influxdb'}->{'server'};
@@ -448,7 +477,7 @@ sub post_to_influxdb {
 
     my $connection_url          = $connection_protocol . "://" . $connection_server . ":" . $connection_port . "/write?db=" . $connection_database;
 
-    logPrint("post_to_influxdb: using url: " . $connection_url) if $DEBUG;
+    $log->debug("Using URL: " . $connection_url);
 
     # User higher resolution time
     my ($s, $usec)              = Time::HiRes::gettimeofday();
@@ -475,10 +504,10 @@ sub post_to_influxdb {
 
     # Send metrics for volumes
     foreach my $system ( keys %$met_coll ) {
-        logPrint("post_to_influxdb: build metrics for [$system]") if $DEBUG;
+        $log->debug("Build metrics for [$system]");
 
         foreach my $volume ( keys %{ $met_coll->{$system} } ) {
-            logPrint("post_to_influxdb: build metrics for volume [$volume]") if $DEBUG;
+            $log->debug("Build metrics for volume [$volume]");
 
             foreach my $metric ( keys %{ $met_coll->{$system}->{$volume} } ) {
 
@@ -493,7 +522,7 @@ sub post_to_influxdb {
                 $num_lines      = $num_lines + 1;
 
                 if ( $num_lines >= $max_metrics_to_send ) {
-                    logPrint( "post_to_influxdb: sending batch of metrics to influxdb...") if $DEBUG;
+                    $log->debug("Sending batch of metrics to influxdb...");
                     $num_lines = 0;
 
 #                    my $response = $connection->post( $connection_url, Content => $metric_lines );
@@ -502,7 +531,7 @@ sub post_to_influxdb {
                         $metric_lines = "";
 #                    }
 #                    else {
-#                        logPrint("post_to_influxdb: request FAILED: " . $response->status_line, 'ERR');
+#                        $log->error("Request FAILED: " . $response->status_line);
 #                        return;
 #                    }
                 }
@@ -511,20 +540,21 @@ sub post_to_influxdb {
     }
 
     # Send the rest of the metrics
-    logPrint( "post_to_influxdb: metrics to send: " . $metric_lines) if $DEBUG;
+    $log->debug( "Metrics to send: " . $metric_lines);
 #    my $response = $connection->post( $connection_url, Content => $metric_lines );
 
 #    if ( !$response->is_success ) {
-#        logPrint("post_to_influxdb: request FAILED: " . $response->status_line, 'ERR');
+#        $log->debug("Request FAILED: " . $response->status_line);
 #    }
 }
 
+# ---------------------------------------------------------------------------------------------------------------------
 # Invoke remote API to get per drive statistics.
 sub get_drive_stats {
     my ( $sys_name, $sys_id, $met_coll ) = (@_);
 
     my $t0 = Benchmark->new;
-    logPrint("API: Calling analysed-drive-statistics");
+    $log->debug("API: Calling analysed-drive-statistics");
     my $stats_response
         = $ua->get( $base_url
             . $API_VER
@@ -533,11 +563,10 @@ sub get_drive_stats {
             . '/analysed-drive-statistics' );
     my $t1 = Benchmark->new;
     my $td = timediff( $t1, $t0 );
-    logPrint( "API: Call took " . timestr($td) );
+    $log->debug("API: Call took " . timestr($td));
     if ( $stats_response->is_success ) {
         my $drive_stats = from_json( $stats_response->decoded_content );
-        logPrint(
-            "get_drive_stats: Number of drives: " . scalar(@$drive_stats) );
+        $log->debug("Number of drives: " . scalar(@$drive_stats));
 
         # skip if no drives present on this system (really possible?)
         if ( scalar(@$drive_stats) ) {
@@ -545,8 +574,7 @@ sub get_drive_stats {
                 $metrics_collected );
         }
         else {
-            warn "Not processing $sys_name because it has no Drives\n"
-                if $DEBUG;
+            $log->warn("Not processing $sys_name because it has no Drives");
         }
     }
     else {
@@ -554,6 +582,7 @@ sub get_drive_stats {
     }
 }
 
+# ---------------------------------------------------------------------------------------------------------------------
 # Coalece Drive metrics into custom structure, to just store the ones
 # we care about.
 sub process_drive_metrics {
@@ -561,7 +590,7 @@ sub process_drive_metrics {
 
     for my $drv (@$drv_mets) {
         my $disk_id = $drv->{diskId};
-        logPrint( "process_drive_metrics: DiskID " . $disk_id ) if $DEBUG;
+        $log->debug("DiskID " . $disk_id);
         my $drv_met_key = "$disk_id";
         $metrics_collected->{$sys_name}->{$drv_met_key} = {};
 
@@ -576,6 +605,7 @@ sub process_drive_metrics {
     }
 }
 
+# ---------------------------------------------------------------------------------------------------------------------
 # Iterate Through the list of systems know by this proxy instance trying to
 # find the provided value with a System Name.
 #
@@ -600,12 +630,13 @@ sub get_sysid_from_name {
     exit 1;
 }
 
+# ---------------------------------------------------------------------------------------------------------------------
 # Invoke remote API to get live performance statistics.
 sub get_live_statistics {
     my ( $sys_name, $sys_id, $met_coll ) = (@_);
 
     my $t0 = Benchmark->new;
-    logPrint("API: Calling live-statistics");
+    $log->debug("API: Calling live-statistics");
     my $stats_response
         = $ua->get( $base_url
             . $API_VER
@@ -614,7 +645,7 @@ sub get_live_statistics {
             . '/live-statistics' );
     my $t1 = Benchmark->new;
     my $td = timediff( $t1, $t0 );
-    logPrint( "API: Call took " . timestr($td) );
+    $log->debug("API: Call took " . timestr($td));
     if ( $stats_response->is_success ) {
         my $live_stats = from_json( $stats_response->decoded_content );
 
@@ -622,7 +653,7 @@ sub get_live_statistics {
         my $cont_stats  = %{$live_stats->{'controllerStats'}};
 
         foreach my $controller (@$cont_stats) {
-            print "controller_stats for controllerId: $controller->{'controllerId'} - ". $controller->{'cpuUtilizationStats'}[0]->{'maxCpuUtilization'}. " \n" if $DEBUG;
+            $log->debug("controller_stats for controllerId: $controller->{'controllerId'} - ". $controller->{'cpuUtilizationStats'}[0]->{'maxCpuUtilization'}. " \n");
             print Dumper(\$controller) if $DEBUG;
         }
         exit 0;
