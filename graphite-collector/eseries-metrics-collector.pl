@@ -83,24 +83,46 @@ our %vol_metrics = (
 );
 
 # Selected metrics to collect from any drive, for ease of reading keep sorted.
-my %drive_metrics = (
-    'averageReadOpSize'    => 0,
-    'averageWriteOpSize'   => 0,
-    'combinedIOps'         => 0,
-    'combinedResponseTime' => 0,
-    'combinedThroughput'   => 0,
-    'otherIOps'            => 0,
-    'readIOps'             => 0,
-    'readOps'              => 0,
-    'readPhysicalIOps'     => 0,
-    'readResponseTime'     => 0,
-    'readThroughput'       => 0,
-    'writeIOps'            => 0,
-    'writeOps'             => 0,
-    'writePhysicalIOps'    => 0,
-    'writeResponseTime'    => 0,
-    'writeThroughput'      => 0,
+our %drive_metrics = (
+    'averageReadOpSize'         => 0,
+    'averageWriteOpSize'        => 0,
+    'combinedIOps'              => 0,
+    'combinedResponseTime'      => 0,
+    'combinedThroughput'        => 0,
+    'otherIOps'                 => 0,
+    'readIOps'                  => 0,
+    'readOps'                   => 0,
+    'readPhysicalIOps'          => 0,
+    'readResponseTime'          => 0,
+    'readThroughput'            => 0,
+    'writeIOps'                 => 0,
+    'writeOps'                  => 0,
+    'writePhysicalIOps'         => 0,
+    'writeResponseTime'         => 0,
+    'writeThroughput'           => 0,
 );
+
+# Metrics to collect from controller
+our %controller_metrics = (
+    'cpuAvgUtilization'         => 0,
+    'averageReadOpSize'         => 0,
+    'averageWriteOpSize'        => 0,
+    'combinedIOps'              => 0,
+    'combinedResponseTime'      => 0,
+    'combinedThroughput'        => 0,
+    'otherIOps'                 => 0,
+    'readIOps'                  => 0,
+    'readOps'                   => 0,
+    'readPhysicalIOps'          => 0,
+    'readResponseTime'          => 0,
+    'readThroughput'            => 0,
+    'writeIOps'                 => 0,
+    'writeOps'                  => 0,
+    'writePhysicalIOps'         => 0,
+    'writeResponseTime'         => 0,
+    'writeThroughput'           => 0,
+);
+
 
 my $metrics_collected;
 my $system_id;
@@ -261,30 +283,44 @@ sub main_loop {
     # Iteration counter
     our $iteration;
 
+    # Some statistics
+    my $nr_systems_ok       = 0;
+    my $nr_systems_failed   = 0;
+
     if ($system_id) {
-        my $storage_systems = call_santricity_api($base_url . '/storage-systems/' . $system_id);
+        my $system = call_santricity_api($base_url . '/storage-systems/' . $system_id);
 
         # When polling only one system we get a Hash.
-        my $system_name = $storage_systems->{name};
-        my $system_id   = $storage_systems->{id};
+        my $system_name = $system->{name};
+        my $system_id   = $system->{id};
 
         $log->debug("Processing $system_name [$system_id]");
 
-        $metrics_collected->{$system_name} = {};
+        if ($system_drivecount > 0) {
+            $log->debug("Processing $system_name [$system_id]");
 
-        get_vol_stats($system_name, $system_id, $metrics_collected);
-#        get_drive_stats( $stg_sys_name, $stg_sys_id, $metrics_collected );
+            $metrics_collected->{$system_name} = {};
+            $nr_systems_ok = $nr_systems_ok + 1;
+
+            get_volume_stats($system_name, $system_id);
+            get_controller_stats($system_name, $system_id);
+#            get_drive_stats($system_name, $system_id);
+        } else {
+            # Skip system (was not reached => other operations will fail)
+            $log->warn("Skipping $system_name [$system_id], no drives / not reachable!");
+            $nr_systems_failed = $nr_systems_failed + 1;
+        }
 
         if ( $opts{'e'} ) {
             # For embedded systems we get extra metrics to poll.
             # not ready yet.
-            #get_live_statistics( $stg_sys_name, $stg_sys_id, $metrics_collected );
+            #get_live_statistics($system_name, $system_id);
         }
     }
     else {
-       my $storage_systems = call_santricity_api($base_url . '/storage-systems' );
+        my $storage_systems = call_santricity_api($base_url . '/storage-systems' );
 
-       # All systems polled, we get an array of hashes.
+        # All systems polled, we get an array of hashes.
         for my $system (@$storage_systems) {
 
 #            print "System hash: \n " . Dumper( \$system );
@@ -297,12 +333,15 @@ sub main_loop {
                 $log->debug("Processing $system_name [$system_id]");
 
                 $metrics_collected->{$system_name} = {};
+                $nr_systems_ok = $nr_systems_ok + 1;
 
-                get_vol_stats($system_name, $system_id, $metrics_collected);
-    #            get_drive_stats( $stg_sys_name, $stg_sys_id, $metrics_collected );
+                get_volume_stats($system_name, $system_id);
+                get_controller_stats($system_name, $system_id);
+    #            get_drive_stats($system_name, $system_id);
             } else {
                 # Skip system (was not reached => other operations will fail)
                 $log->warn("Skipping $system_name [$system_id], no drives / not reachable!");
+                $nr_systems_failed = $nr_systems_failed + 1;
             }
         }
     }
@@ -333,7 +372,7 @@ sub call_santricity_api {
     our $santricity_connection;
     our $base_url;
 
-    $log->info("API request: " . $request_url);
+    $log->debug("API request: " . $request_url);
     
     my $i = 1;
     while ($i <= MAX_RETRIES) {
@@ -365,21 +404,41 @@ sub call_santricity_api {
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Invoke remote API to get per volume statistics.
-sub get_vol_stats {
+sub get_volume_stats {
 
-    my ( $sys_name, $sys_id, $met_coll ) = (@_);
+    my ($sys_name, $sys_id) = (@_);
 
     $log->debug("Calling analysed-volume-statistics...");
 
     my $vol_stats = call_santricity_api($base_url . '/storage-systems/' . $sys_id . '/analysed-volume-statistics');
-    $log->debug( "get_vol_stats: Number of vols: " . scalar(@$vol_stats) );
+    $log->debug("Number of vols: " . scalar(@$vol_stats));
 
-    # skip if no vols present on this system
+    # Skip if no vols present on this system
     if ( scalar(@$vol_stats) ) {
-        process_vol_metrics( $sys_name, $vol_stats, $metrics_collected );
+        process_vol_metrics($sys_name, $vol_stats);
     }
     else {
-        $log->warn("Not processing $sys_name because it has no Volumes\n");
+        $log->warn("Not processing [$sys_name] because it has no volumes!");
+    }
+}
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Invoke remote API to get controller statistics.
+sub get_controller_stats {
+
+    my ($sys_name, $sys_id) = (@_);
+
+    $log->debug("Calling analysed-controller-statistics...");
+
+    my $controller_stats = call_santricity_api($base_url . '/storage-systems/' . $sys_id . '/analysed-controller-statistics');
+    $log->debug("Number of controllers: " . scalar(@$controller_stats));
+
+    # Skip if no controller present on this system (this would be rather strange, of course ;)
+    if ( scalar(@$controller_stats) ) {
+        process_controller_metrics($sys_name, $controller_stats);
+    }
+    else {
+        $log->warn("Not processing [$sys_name] because it has no controllers (WTF?)!");
     }
 }
 
@@ -387,22 +446,52 @@ sub get_vol_stats {
 # Coalece Collecter metrics into custom structure, to just store the ones
 # we care about.
 sub process_vol_metrics {
-    my ( $sys_name, $vol_mets, $met_coll ) = (@_);
-    our %vol_metrics;
+    my ($sys_name, $volume_metrics) = (@_);
 
-    for my $vol (@$vol_mets) {
-        my $vol_name = $vol->{volumeName};
-        $log->debug( "process_vol_metrics: Volume Name " . $vol_name );
-        my $vol_met_key = "$vol_name";
-        $metrics_collected->{$sys_name}->{$vol_met_key} = {};
+    our %vol_metrics;
+    our $metrics_collected;
+
+    for my $volume (@$volume_metrics) {
+        my $volume_name = $volume->{volumeName};
+        $log->debug("Volume name: " . $volume_name );
+        $metrics_collected->{$sys_name}->{$volume_name} = {};
 
         #print Dumper($vol);
-        foreach my $met_name ( keys %{$vol} ) {
+        foreach my $metric_name (keys %{$volume}) {
 
             #print "Met name = $met_name\n";
-            if ( exists $vol_metrics{$met_name} ) {
-                $met_coll->{$sys_name}->{$vol_met_key}->{$met_name}
-                    = $vol->{$met_name};
+            if (exists $vol_metrics{$metric_name}) {
+                $metrics_collected->{$sys_name}->{$volume_name}->{$metric_name} = $volume->{$metric_name};
+            }
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Coalece Collecter metrics into custom structure, to just store the ones
+# we care about.
+sub process_controller_metrics {
+    my ($sys_name, $controller_metrics) = (@_);
+
+    our %controller_metrics;
+    our $metrics_collected;
+
+    my $controller_id = 1;
+    for my $controller (@$controller_metrics) {
+
+        # Create simple controller name: real controller ids are too long
+        my $controller_name = "controller" . $controller_id;
+        $controller_id = $controller_id + 1;
+
+        $log->debug("Controller name: " . $controller_name);
+        $metrics_collected->{$sys_name}->{$controller_name} = {};
+
+        #print Dumper($vol);
+        foreach my $metric_name ( keys %{$controller} ) {
+
+            #print "Met name = $met_name\n";
+            if ( exists $controller_metrics{$metric_name} ) {
+                $metrics_collected->{$sys_name}->{$controller_name}->{$metric_name} = $controller->{$metric_name};
             }
         }
     }
@@ -524,7 +613,7 @@ sub post_to_influxdb {
                     $log->debug("Sending batch of metrics to influxdb...");
                     $num_lines = 0;
 
-                    my $response = $connection->post( $connection_url, Content => $metric_lines );
+                    my $response = $connection->post($connection_url, Content => $metric_lines);
 
 #                    print "InfluxDB request content: " . $metric_lines;
 
@@ -553,7 +642,7 @@ sub post_to_influxdb {
 # Invoke remote API to get per drive statistics.
 sub get_drive_stats {
 
-    my ( $sys_name, $sys_id, $met_coll ) = (@_);
+    my ($sys_name, $sys_id) = (@_);
 
     $log->debug("Calling analysed-drive-statistics...");
 
@@ -561,8 +650,8 @@ sub get_drive_stats {
     $log->debug("Number of drives: " . scalar(@$drive_stats));
 
     # skip if no drives present on this system (really possible?)
-    if ( scalar(@$drive_stats) ) {
-        process_drive_metrics( $sys_name, $drive_stats, $metrics_collected );
+    if (scalar(@$drive_stats)) {
+        process_drive_metrics($sys_name, $drive_stats);
     }
     else {
         $log->warn("Not processing [$sys_name] because it has no drives.");
@@ -574,20 +663,23 @@ sub get_drive_stats {
 # we care about.
 sub process_drive_metrics {
 
-    my ( $sys_name, $drv_mets, $met_coll ) = (@_);
+    my ($sys_name, $drive_metrics) = (@_);
 
-    for my $drv (@$drv_mets) {
-        my $disk_id = $drv->{diskId};
+    our %drive_metrics;
+    our $metrics_collected;
+
+    for my $drive (@$drive_metrics) {
+
+        my $disk_id = $drive->{diskId};
         $log->debug("Disk-ID: " . $disk_id);
-        my $drv_met_key = "$disk_id";
-        $metrics_collected->{$sys_name}->{$drv_met_key} = {};
 
-        #print Dumper($drv);
-        foreach my $met_name ( keys %{$drv} ) {
+        $metrics_collected->{$sys_name}->{$disk_id} = {};
+
+        #print Dumper($drive);
+        foreach my $met_name ( keys %{$drive} ) {
 
             if ( exists $drive_metrics{$met_name} ) {
-                $met_coll->{$sys_name}->{$drv_met_key}->{$met_name}
-                    = $drv->{$met_name};
+                $metrics_collected->{$sys_name}->{$disk_id}->{$met_name} = $drive->{$met_name};
             }
         }
     }
